@@ -1,0 +1,160 @@
+---
+title: "Count depth variation makes Poisson scRNA-seq data Negative Binomial"
+output: html_notebook
+---
+
+```{r warning=FALSE}
+library(tidyverse)
+library(patchwork)
+theme_set(theme_bw())
+```
+
+In the scRNA-seq community the observation of more zero values than expected (called the "dropout problem") is still a concern. The source seems to be an intuition that at such small scales of biological material as RNA from individual cells, molecular reactions lose efficiency due to conceptual stochastic events. The trendiest computational research directions in the field at the moment are probably tied between "how do we do this for a million cells?" and "how do we deal with the dropouts?". In particular droplet based scRNA-seq methods are considered to have more dropouts, often leading investigators that opt for more expensive plate based methods even for exploratory pilot experiments.
+
+In [negative control data there is no evidence for zero inflation](http://www.nxn.se/valent/2017/11/16/droplet-scrna-seq-is-not-zero-inflated) on top of negative binomial noise, counter to what is commonly suggested (in particular for droplet based methods). A notion that has inspired [significant](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-015-0805-z) [research](https://www.biorxiv.org/content/early/2017/06/30/157982) [efforts](https://www.nature.com/articles/s41467-017-02554-5). A recent interesting report by [Wagner, Yan, & Yanai](https://www.biorxiv.org/content/early/2018/01/24/217737) goes even further and illustrates that the Poisson distribution is sufficient to represent technical noise in scRNA-seq data. The authors write that additional variation in gene counts is due to _efficiency noise_ (an observatin from [Grün, Kester, & van Oudenaarden](http://www.nature.com/doifinder/10.1038/nmeth.2930) that different tubes of reagents appear to have different success rates), and can be accounted for by an averaging approach.
+
+This can be explored by simulating data! Say droplets contain transcripts from 300 genes, whose relative abundance levels are fixed because they come from the same RNA solution. Then a droplet with \\( d \\) transcripts can be seen as a draw from a multinomial distribution,
+
+\[
+c_i \sim \text{Multinom} (d, (p_1, \ldots, p_{300})).
+\]
+
+Now each gene will independently conform to a Poisson distribution.
+
+```{r}
+n_genes <- 300
+relative_expression <- 10 ** (runif(n_genes, -4, 2))
+relative_expression <- relative_expression / sum(relative_expression)
+
+n_cells <- 1000
+depth <- 1e5
+
+counts <- rmultinom(n_cells, depth, relative_expression)
+
+```
+
+```{r}
+qplot(apply(counts, 1, mean), apply(counts, 1, var), log='xy') + 
+  labs(x = 'Mean', y = 'Variance', title = 'Counts from multinomial') + 
+  geom_abline(color = 'red')
+```
+
+The constant mean-variance relation for Poisson holds (as expected) for this simulation. In [actual data](http://www.nxn.se/valent/2017/11/16/droplet-scrna-seq-is-not-zero-inflated), genes with higher abundance are _over dispersed_, which can be modeled using a negative binomial distribution.
+
+The negative binomial distribution is constructed as a [mixture of Poisson distributions](https://en.wikipedia.org/wiki/Negative_binomial_distribution#Gamma%E2%80%93Poisson_mixture), where the rate parameter follows a Gamma distribution. [Other Poisson mixtures](https://academic.oup.com/bioinformatics/article/32/14/2128/2288270) have also been suggested for scRNA-seq data.
+
+An aspect of real data which our mutlinomial simulation does not account for is that the total counts observed in each droplet is variable. Indeed, usually a cutoff at some low number of total counts per droplet is used to decide which droplets captured cells and which only contain background material that is not of interest.
+
+```{r message=FALSE, warning=FALSE}
+klein <- read_csv('Klein_RNA_control.csv', progress = FALSE) %>% as.matrix
+klein <- klein[,-1]
+class(klein) <- 'numeric'
+```
+
+```{r}
+klein_depths <- apply(klein, 2, sum)
+df <- data.frame(total_count = klein_depths)
+
+ggplot(df, aes(x = total_count)) + geom_histogram(binwidth = 1000) + 
+  labs(y = 'Number of droplets',
+       title = 'Klein et al',
+       x = 'Total counts per droplet',
+       subtitle = 'InDrop data')
+```
+
+Thinking about the abundance levels of the different genes as _rates_ in Poisson distributions require each observation to come from a constant count depth. If the count depth varies in each observation but the model is not informed of this, it will appear as if the rate for each gene is variable, and this will be more consistent with a negative binomial distribution.
+
+As an illustration, in the simulation, variation in _count depths_ can be included. For simplicity, a uniform distribution is used,
+
+\begin{align}
+d_i & \sim \text{Uniform}(5.000, 100.000), \\
+c_i & \sim \text{Multinom} (d_i, (p_1, \ldots, p_{300})).
+\end{align}
+
+```{r}
+depth <- runif(n_cells, 5e3, 1e5)
+
+draw_cell_expression <- function(depth) {
+  rmultinom(1, depth, relative_expression)
+}
+
+counts <- sapply(depth, draw_cell_expression)
+
+```
+
+```{r}
+qplot(apply(counts, 1, mean), apply(counts, 1, var), log='xy') + 
+  labs(x = 'Mean', y = 'Variance', title = 'Counts from multinomial with variable count depth') + 
+  geom_abline(color = 'red')
+```
+
+These new values clearly have the quadratic polynomial mean-variance relation that is typical for scRNA-seq counts.
+
+This indicates we need to handle the differences in count depth. The easiest solution is to simply divide the expression counts in each cell with the total depth, turning each expression value into a fraction.
+
+In the RNA-seq field it is also common to also multiply these fractions by 1 million to form the "CPM" unit.
+
+```{r}
+fracs <- t(t(counts) / apply(counts, 2, sum))
+cpm <- fracs * 1e6
+scaled_fracs <- fracs * 3.5e4  # Can this offset be found analytically?
+
+p_frac <- qplot(apply(fracs, 1, mean), apply(fracs, 1, var), log='xy') +
+  geom_abline(color = 'red') + 
+  labs(x = 'Mean', y = 'Variance', title = 'Fractions')
+
+p_cpm <- qplot(apply(cpm, 1, mean), apply(cpm, 1, var), log='xy') +
+  geom_abline(color = 'red') + 
+  labs(x = 'Mean', y = 'Variance', title = 'CPM')
+
+p_sfrac <- qplot(apply(scaled_fracs, 1, mean), apply(scaled_fracs, 1, var), log='xy') +
+  geom_abline(color = 'red') + 
+  labs(x = 'Mean', y = 'Variance', title = 'Scaled fractions')
+
+p_frac + p_cpm + p_sfrac
+```
+
+It is clear that after creating either fractions or CPM will follow a linear relation between mean and variance. However, in both cases there is an offset from the unit relation, and in particular for the CPM unit the variance gets inflated compared to the mean.
+
+The thrid panel shows the result after manually scaling the fractions (through multiplication by 3.5e4) to achieve the Poisson mean = variance relation. (There is probably a closed form expression for the scaling factor that achieves this, and the 1e6 is above this, explaining the variance inflation.)
+
+It is entirely possible that the this type of scaling to create CPM from fractions is one reason people have noticed higher than expected numbers of zeros. For Poisson data, the expected number of zeros at a given mean expression level is given by the function \\( e^\{-\\mu\} \\).
+
+```{r}
+df <- data.frame(x = apply(counts, 1, mean), y = apply(counts == 0, 1, sum) / n_cells)
+p_counts <- ggplot(df, aes(x, y)) +
+  geom_point() +
+  stat_function(aes(x), fun = function(x) { exp(-x) }, color = 'red') + 
+  scale_x_log10() +
+  labs(x = 'Mean', y = 'Dropout probability', title = 'Counts')
+
+df <- data.frame(x = apply(fracs, 1, mean), y = apply(fracs == 0, 1, sum) / n_cells)
+p_fracs <- ggplot(df, aes(x, y)) +
+  geom_point() +
+  stat_function(aes(x), fun = function(x) { exp(-x) }, color = 'red') + 
+  scale_x_log10() +
+  labs(x = 'Mean', y = 'Dropout probability', title = 'Fractions')
+
+df <- data.frame(x = apply(cpm, 1, mean), y = apply(cpm == 0, 1, sum) / n_cells)
+p_cpm <- ggplot(df, aes(x, y)) +
+  geom_point() +
+  stat_function(aes(x), fun = function(x) { exp(-x) }, color = 'red') + 
+  scale_x_log10() +
+  labs(x = 'Mean', y = 'Dropout probability', title = 'CPM')
+
+df <- data.frame(x = apply(scaled_fracs, 1, mean), y = apply(scaled_fracs == 0, 1, sum) / n_cells)
+p_sf <- ggplot(df, aes(x, y, color = 'Genes')) +
+  geom_point() +
+  stat_function(aes(x, color = 'Poisson'), fun = function(x) { exp(-x) }) + 
+  scale_x_log10() +
+  labs(x = 'Mean', y = 'Dropout probability', title = 'Scaled fractions') +
+  scale_colour_manual("", values = c('black', 'red'))
+
+p_counts + p_fracs + p_cpm + p_sf
+```
+
+The counts themselves follow the theoretical curve quite close, but with an increase of zeros at high expression levels, consistent with [negative binomial zeros](http://www.nxn.se/valent/2017/11/16/droplet-scrna-seq-is-not-zero-inflated). 'Fractions' see a large offset of much fewer zeros than is expected given the mean, while CPM see an offset for more zeros than expected. The manually scaled values follow the theoretical curve decently, though far from exactly.
+
+For interpretable analysis, counts should be scaled for total count depth, but this also need to be taken under consideration when looking at the results (e.g. dropout rate). The best solution might be to take inspiration from the field of generalised linear models. In that field _offsets_ are included in models when there is a clear explanation for variation in counts, to [convert counts to _rates_](https://stats.stackexchange.com/questions/175349/in-a-poisson-model-what-is-the-difference-between-using-time-as-a-covariate-or). Clustering or pseudotime methods could be reformulated to the Poisson setting with offsets.
+
+There are some additional aspects to keep in mind. For negative control data where each droplet contains RNA from the same solution, the count depth variability must be technical, but in real samples this could also be due to cells having variable amounts of RNA. For droplet based data one simple reason for the heterogeneity could be due to variation in coverage for DNA oligos on barcoded beads. It is not clear what an explanation for plate based methods would be, and no proper negative control data exist for plate based methods to investigate these properties. On a similar note, the latest single cell sequencing methods based on [stochastic schemes for _in situ_ barcoding of cells](http://science.sciencemag.org/content/357/6352/661) are impossible to assess with negative control samples.
